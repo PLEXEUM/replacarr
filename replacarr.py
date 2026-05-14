@@ -172,6 +172,61 @@ class PlexClient:
             "X-Plex-Product": "replacarr",
             "X-Plex-Client-Identifier": "replacarr"
         }
+
+    async def _request_flexible(self, endpoint: str, timeout: int = 30) -> Optional[Dict]:
+        """Make request to Plex API, trying JSON first, falling back to XML parsing."""
+        sep = "&" if "?" in endpoint else "?"
+        url = f"{self.url}{endpoint}{sep}X-Plex-Token={self.token}"
+        
+        # Try JSON first
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.get(url, headers={**self.headers, "Accept": "application/json"})
+                if response.status_code == 200:
+                    try:
+                        data = response.json()
+                        if data and data.get("MediaContainer"):
+                            logger.debug(f"JSON response successful for {endpoint}")
+                            return data
+                    except:
+                        pass
+        except Exception as e:
+            logger.debug(f"JSON request failed for {endpoint}: {e}")
+        
+        # Fallback to XML
+        logger.debug(f"Falling back to XML for {endpoint}")
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.get(url, headers={**self.headers, "Accept": "application/xml"})
+                if response.status_code == 200:
+                    import xml.etree.ElementTree as ET
+                    root = ET.fromstring(response.text)
+                    return self._xml_to_dict(root)
+        except Exception as e:
+            logger.error(f"XML fallback failed for {endpoint}: {e}")
+        
+        return None
+    
+    def _xml_to_dict(self, element) -> Dict:
+        """Convert XML element to dict format matching Plex JSON structure."""
+        result = {"MediaContainer": {}}
+        
+        # Add attributes
+        for key, value in element.attrib.items():
+            result["MediaContainer"][key] = value
+        
+        # Add children as Metadata list
+        children = []
+        for child in element:
+            child_dict = {}
+            for key, value in child.attrib.items():
+                child_dict[key] = value
+            children.append(child_dict)
+        
+        if children:
+            result["MediaContainer"]["Metadata"] = children
+        
+        return result
     
     async def test_connection(self) -> Tuple[bool, str]:
         """Test connection to Plex."""
@@ -278,16 +333,12 @@ class PlexClient:
         logger.debug(f"Fetching play history with pagination (cutoff: {days_back} days ago)")
     
         while True:
-            try:
-                async with httpx.AsyncClient(timeout=60) as client:
-                    response = await client.get(
-                        f"{self.url}/status/sessions/history/all?allUsers=1&X-Plex-Container-Start={start}&X-Plex-Container-Size={page_size}",
-                        headers=self.headers
-                    )
-                    response.raise_for_status()
-                    data = response.json()
-            except Exception as e:
-                logger.error(f"Failed to fetch Plex play history page (start={start}): {e}")
+            # Use flexible request that handles JSON or XML
+            endpoint = f"/status/sessions/history/all?X-Plex-Container-Start={start}&X-Plex-Container-Size={page_size}&allUsers=1"
+            data = await self._request_flexible(endpoint, timeout=60)
+        
+            if not data:
+                logger.error(f"Failed to fetch Plex play history page (start={start})")
                 break
         
             metadata = data.get("MediaContainer", {}).get("Metadata", [])
