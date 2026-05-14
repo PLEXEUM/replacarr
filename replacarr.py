@@ -321,48 +321,20 @@ class PlexClient:
     
     async def get_recently_played_movies(self, days_back: int, tmdb_mapping: Dict[str, int]) -> List[Dict]:
         """
-        Get movies played in the last X days with pagination (no 1000 cap).
+        Get movies played in the last X days.
         Returns list of dicts with title, year, tmdb_id (if available), play_count, last_viewed
         """
         cutoff_time = int(time.time()) - (days_back * 86400)
-    
-        all_history = []
-        start = 0
-        page_size = 1000
-    
-        logger.debug(f"Fetching play history with pagination (cutoff: {days_back} days ago)")
-    
-        while True:
-            # Use flexible request that handles JSON or XML
-            endpoint = f"/status/sessions/history/all?X-Plex-Container-Start={start}&X-Plex-Container-Size={page_size}&allUsers=1"
-            data = await self._request_flexible(endpoint, timeout=60)
-        
-            if not data:
-                logger.error(f"Failed to fetch Plex play history page (start={start})")
-                break
-        
-            metadata = data.get("MediaContainer", {}).get("Metadata", [])
-            if not metadata:
-                logger.debug(f"No metadata returned for page start={start}, stopping")
-                break
-        
-            all_history.extend(metadata)
-            logger.debug(f"Fetched page {start//page_size + 1}: {len(metadata)} entries (total so far: {len(all_history)})")
-        
-            # Check if we've fetched everything
-            total_size = data.get("MediaContainer", {}).get("totalSize", 0)
-            if total_size > 0 and len(all_history) >= total_size:
-                logger.debug(f"Reached totalSize={total_size}, stopping pagination")
-                break
 
-            # Continue to next page
-            start += len(metadata)
-        
-            # Safety check: Don't fetch more than 10,000 entries
-            if start > 10000:
-                logger.warning(f"Reached safety limit of 10,000 entries, stopping pagination")
-                break
-
+        # Fetch all history at once with sorting (newest first)
+        endpoint = f"/status/sessions/history/all?X-Plex-Container-Size=100000&allUsers=1&sort=viewedAt:desc"
+        data = await self._request_flexible(endpoint, timeout=120)
+    
+        if not data:
+            logger.error("Failed to fetch Plex play history")
+            return []
+    
+        all_history = data.get("MediaContainer", {}).get("Metadata", [])
         logger.info(f"Fetched {len(all_history)} total history entries from Plex")
 
         # Process history entries (rest of the function remains the same)
