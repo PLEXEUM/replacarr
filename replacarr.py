@@ -32,6 +32,10 @@ LOG_DIR.mkdir(exist_ok=True)
 # Setup logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
+# Clear any existing handlers
+for handler in logging.root.handlers[:]:
+    logging.root.removeHandler(handler)
+
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -707,8 +711,12 @@ async def main():
         movies_checked.append(movie_info)
         
         if should_upgrade:
-            logger.info(f"✓ '{movie_title} ({movie_year})' - {current_quality} → needs upgrade ({reason})")
-            movies_to_replace.append(movie_info)
+            # Check for duplicate before adding
+            if movie_id not in [m["movie_id"] for m in movies_to_replace]:
+                logger.info(f"✓ '{movie_title} ({movie_year})' - {current_quality} → needs upgrade ({reason})")
+                movies_to_replace.append(movie_info)
+            else:
+                logger.debug(f"⚠ Skipping duplicate: '{movie_title}' already in replacement queue")
         else:
             logger.debug(f"✗ '{movie_title} ({movie_year})' - {current_quality} → {reason}")
     
