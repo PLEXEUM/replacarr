@@ -295,20 +295,41 @@ class PlexClient:
                 logger.debug(f"No metadata returned for page start={start}, stopping")
                 break
         
+            # Check if all items on this page are older than cutoff
+            oldest_on_page = None
+            for item in metadata:
+                viewed_at = item.get("viewedAt", 0)
+                if oldest_on_page is None or viewed_at < oldest_on_page:
+                    oldest_on_page = viewed_at
+        
+            # If the most recent item on this page is already older than cutoff, stop
+            # (Since Plex returns newest first, once we hit cutoff, all remaining are older)
+            if oldest_on_page is not None and oldest_on_page < cutoff_time:
+                logger.debug(f"Cutoff optimization: oldest_on_page={oldest_on_page}, cutoff_time={cutoff_time}")
+                # Only add items that meet the cutoff from this partial page
+                for item in metadata:
+                    if item.get("viewedAt", 0) >= cutoff_time:
+                        all_history.append(item)
+                logger.debug(f"Reached cutoff time - stopping pagination")
+                break
+        
+            # Add all items from this page (they're all within cutoff)
             all_history.extend(metadata)
-            page_num = (start // page_size) + 1
-            logger.debug(f"Fetched page {page_num}: {len(metadata)} entries (total so far: {len(all_history)})")
+            logger.debug(f"Fetched page {start//page_size + 1}: {len(metadata)} entries (total so far: {len(all_history)})")
         
             # Check if we've fetched everything
             total_size = data.get("MediaContainer", {}).get("totalSize", 0)
             if total_size > 0 and len(all_history) >= total_size:
                 logger.debug(f"Reached totalSize={total_size}, stopping pagination")
                 break
-            if len(metadata) < page_size:
-                logger.debug(f"Last page had fewer than {page_size} entries, stopping pagination")
-                break
-        
+            
+            # Continue to next page
             start += len(metadata)
+        
+            # Safety check: Don't fetch more than 10,000 entries
+            if start > 10000:
+                logger.warning(f"Reached safety limit of 10,000 entries, stopping pagination")
+                break
     
         logger.info(f"Fetched {len(all_history)} total history entries from Plex")
     
