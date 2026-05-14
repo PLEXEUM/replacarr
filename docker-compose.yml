@@ -1,0 +1,11 @@
+services:
+  replacarr:
+    image: plexeum/replacarr:latest
+    container_name: replacarr
+    restart: unless-stopped
+    volumes:
+      - ./config/.env:/app/config/.env:ro
+      - ./logs:/app/logs
+    environment:
+      - TZ=America/New_York
+      - CRON_SCHEDULE=0 2 * * *

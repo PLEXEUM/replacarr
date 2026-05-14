@@ -1,0 +1,15 @@
+# Environment variables (contains secrets)
+.env
+
+# Log files and runtime data
+logs/
+*.log
+*.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Docker related
+*.pid
