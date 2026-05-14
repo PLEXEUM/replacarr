@@ -10,6 +10,7 @@ import json
 import logging
 import sys
 import time
+import asyncio 
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -178,83 +179,18 @@ class PlexClient:
         except Exception as e:
             return False, f"Connection failed: {str(e)}"
     
-    async def get_library_items(self) -> Dict[str, int]:
-        """
-        Fetch all movies from Plex and map ratingKey to TMDb ID.
-        Returns dict: {rating_key: tmdb_id}
-        """
-        rating_to_tmdb = {}
-        
-        try:
-            # Get all library sections
-            async with httpx.AsyncClient(timeout=30) as client:
-                response = await client.get(
-                    f"{self.url}/library/sections",
-                    headers=self.headers
-                )
-                response.raise_for_status()
-                data = response.json()
-        except Exception as e:
-            logger.error(f"Failed to fetch Plex sections: {e}")
-            return rating_to_tmdb
-        
-        sections = data.get("MediaContainer", {}).get("Directory", [])
-        movie_sections = [s for s in sections if s.get("type") == "movie"]
-        
-        for section in movie_sections:
-            section_id = section.get("key")
-            if not section_id:
-                continue
-            
-            logger.debug(f"Scanning movie section: {section.get('title')} (ID: {section_id})")
-            
-            try:
-                async with httpx.AsyncClient(timeout=60) as client:
-                    response = await client.get(
-                        f"{self.url}/library/sections/{section_id}/all",
-                        headers=self.headers
-                    )
-                    response.raise_for_status()
-                    data = response.json()
-            except Exception as e:
-                logger.warning(f"Failed to fetch items from section {section_id}: {e}")
-                continue
-            
-            metadata = data.get("MediaContainer", {}).get("Metadata", [])
-            
-            for item in metadata:
-                rating_key = str(item.get("ratingKey"))
-                if not rating_key:
-                    continue
-                
-                # Extract TMDb ID from Guids
-                tmdb_id = None
-                guids = item.get("Guid", [])
-                for guid in guids:
-                    guid_id = guid.get("id", "")
-                    if guid_id.startswith("tmdb://"):
-                        tmdb_id = guid_id.replace("tmdb://", "")
-                        break
-                
-                if tmdb_id:
-                    rating_to_tmdb[rating_key] = int(tmdb_id)
-                    logger.debug(f"  Mapped: {item.get('title')} ({rating_key}) -> TMDb: {tmdb_id}")
-        
-        logger.info(f"Plex library mapping: {len(rating_to_tmdb)} movies")
-        return rating_to_tmdb
-    
-    async def get_recently_played_movies(self, days_back: int, rating_to_tmdb: Dict[str, int]) -> List[Dict]:
+    async def get_recently_played_movies(self, days_back: int) -> List[Dict]:
         """
         Get movies played in the last X days with their play counts.
-        Returns list of dicts with tmdb_id, play_count, last_viewed
+        Returns list of dicts with title, year, play_count, last_viewed
         """
         # Calculate cutoff timestamp
         cutoff_time = int(time.time()) - (days_back * 86400)
-        
+    
         # Fetch all play history
         try:
             async with httpx.AsyncClient(timeout=60) as client:
-                response = await client.get(
+             response = await client.get(
                     f"{self.url}/status/sessions/history/all?allUsers=1&X-Plex-Container-Start=0&X-Plex-Container-Size=1000",
                     headers=self.headers
                 )
@@ -263,52 +199,54 @@ class PlexClient:
         except Exception as e:
             logger.error(f"Failed to fetch Plex play history: {e}")
             return []
-        
+    
         metadata = data.get("MediaContainer", {}).get("Metadata", [])
         logger.debug(f"Fetched {len(metadata)} total history entries")
-        
-        # Track play counts and last viewed per TMDb ID
-        play_stats: Dict[int, Dict] = {}
-        
+    
+        # Track play counts and last viewed per movie (by title + year)
+        play_stats: Dict[str, Dict] = {}
+    
         for item in metadata:
             # Only process movies (type "movie")
             if item.get("type") != "movie":
                 continue
-            
-            rating_key = str(item.get("ratingKey"))
-            if not rating_key or rating_key not in rating_to_tmdb:
+        
+            title = item.get("title", "")
+            year = item.get("year", "")
+        
+            if not title:
                 continue
-            
-            tmdb_id = rating_to_tmdb[rating_key]
+        
+            # Create unique key from title + year
+            movie_key = f"{title}|{year}" if year else title
             viewed_at = item.get("viewedAt", 0)
-            
+        
             if viewed_at < cutoff_time:
                 continue
-            
-            if tmdb_id not in play_stats:
-                play_stats[tmdb_id] = {"play_count": 0, "last_viewed": 0}
-            
-            play_stats[tmdb_id]["play_count"] += 1
-            
-            if viewed_at > play_stats[tmdb_id]["last_viewed"]:
-                play_stats[tmdb_id]["last_viewed"] = viewed_at
         
+            if movie_key not in play_stats:
+                play_stats[movie_key] = {
+                    "title": title,
+                    "year": year,
+                    "play_count": 0,
+                    "last_viewed": 0
+                }
+        
+            play_stats[movie_key]["play_count"] += 1
+        
+            if viewed_at > play_stats[movie_key]["last_viewed"]:
+                play_stats[movie_key]["last_viewed"] = viewed_at
+    
         # Convert to list format
-        result = []
-        for tmdb_id, stats in play_stats.items():
-            result.append({
-                "tmdb_id": tmdb_id,
-                "play_count": stats["play_count"],
-                "last_viewed": stats["last_viewed"]
-            })
-        
+        result = list(play_stats.values())
+    
         logger.info(f"Found {len(result)} movies played in the last {days_back} days")
-        
+    
         # Log first few for debugging
         for movie in result[:5]:
             last_viewed_date = datetime.fromtimestamp(movie["last_viewed"]).strftime("%Y-%m-%d")
-            logger.debug(f"  TMDb {movie['tmdb_id']}: {movie['play_count']} plays, last: {last_viewed_date}")
-        
+            logger.debug(f"  '{movie['title']} ({movie['year']})': {movie['play_count']} plays, last: {last_viewed_date}")
+    
         return result
 
 # ============================================================================
@@ -330,8 +268,8 @@ class RadarrClient:
         except Exception as e:
             return False, f"Connection failed: {str(e)}"
     
-    async def get_movies_by_tmdb_id(self, tmdb_id: int) -> Optional[Dict]:
-        """Find a movie in Radarr by TMDb ID."""
+    async def get_movie_by_title_year(self, title: str, year: str) -> Optional[Dict]:
+        """Find a movie in Radarr by title and year."""
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 response = await client.get(
@@ -343,14 +281,32 @@ class RadarrClient:
         except Exception as e:
             logger.error(f"Failed to fetch movies from Radarr: {e}")
             return None
-        
+    
+        # Search for matching title and year
+        title_lower = title.lower().strip()
+        year_int = int(year) if year and year.isdigit() else None
+    
         for movie in movies:
-            if movie.get("tmdbId") == tmdb_id:
-                logger.debug(f"Found movie in Radarr: {movie.get('title')} (ID: {movie.get('id')})")
-                return movie
+            movie_title = movie.get("title", "").lower().strip()
+            movie_year = movie.get("year")
         
-        logger.debug(f"No Radarr entry found for TMDb ID: {tmdb_id}")
+            # Title match (exact or partial)
+            title_match = (title_lower == movie_title or 
+                        title_lower in movie_title or 
+                        movie_title in title_lower)
+        
+            # Year match (if both have years)
+            year_match = True
+            if year_int and movie_year:
+                year_match = (year_int == movie_year)
+        
+            if title_match and year_match:
+                logger.debug(f"Found movie in Radarr: {movie.get('title')} ({movie.get('year')}) - ID: {movie.get('id')}")
+                return movie
+    
+        logger.debug(f"No Radarr entry found for: {title} ({year})")
         return None
+    
     
     async def get_movie_quality(self, movie_id: int) -> Optional[str]:
         """Get current quality of a movie's file."""
@@ -507,13 +463,9 @@ async def main():
     state = load_last_run_state()
     processed_movies = state.get("processed_movies", {})
     
-    # Step 1: Get Plex library mapping (ratingKey -> TMDb ID)
-    logger.info("Step 1: Fetching Plex library mapping...")
-    rating_to_tmdb = await plex.get_library_items()
-    
-    # Step 2: Get recently played movies from Plex
-    logger.info(f"Step 2: Fetching movies played in the last {config['recent_days']} days...")
-    recently_played = await plex.get_recently_played_movies(config["recent_days"], rating_to_tmdb)
+    # Step 1: Get recently played movies from Plex (no mapping needed)
+    logger.info(f"Step 1: Fetching movies played in the last {config['recent_days']} days...")
+    recently_played = await plex.get_recently_played_movies(config["recent_days"])
     
     if not recently_played:
         logger.info("No recently played movies found")
@@ -521,19 +473,18 @@ async def main():
         logger.info("replacarr Complete - Nothing to process")
         return
     
-    # Step 3: Check each movie in Radarr
+    # Step 2: Check each movie in Radarr
     logger.info("Step 3: Checking quality in Radarr...")
     
     movies_to_replace = []
     movies_checked = []
     
     for movie in recently_played:
-        tmdb_id = movie["tmdb_id"]
         
-        # Find in Radarr
-        radarr_movie = await radarr.get_movies_by_tmdb_id(tmdb_id)
+        # Find in Radarr by title/year
+        radarr_movie = await radarr.get_movie_by_title_year(movie["title"], movie["year"])
         if not radarr_movie:
-            logger.debug(f"Movie TMDb {tmdb_id} not found in Radarr - skipping")
+            logger.debug(f"Movie '{movie['title']} ({movie['year']})' not found in Radarr - skipping")
             continue
         
         movie_id = radarr_movie.get("id")
@@ -573,7 +524,7 @@ async def main():
         else:
             logger.debug(f"✗ '{movie_title} ({movie_year})' - {current_quality} → {reason}")
     
-    # Step 4: Apply replacements (up to max per run)
+    # Step 3: Apply replacements (up to max per run)
     logger.info(f"Step 4: Triggering replacements (max {config['max_replacements_per_run']} per run)...")
     
     replaced_count = 0
@@ -597,7 +548,7 @@ async def main():
         # Small delay between deletions
         await asyncio.sleep(1)
     
-    # Step 5: Save results
+    # Step 4: Save results
     logger.info("Step 5: Saving run results...")
     save_last_run_state(processed_movies)
     
