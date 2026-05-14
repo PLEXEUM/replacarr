@@ -179,35 +179,140 @@ class PlexClient:
         except Exception as e:
             return False, f"Connection failed: {str(e)}"
     
-    async def get_recently_played_movies(self, days_back: int) -> List[Dict]:
+    def _extract_tmdb_from_item(self, item: dict) -> Optional[int]:
         """
-        Get movies played in the last X days with their play counts.
-        Returns list of dicts with title, year, play_count, last_viewed
+        Extract TMDb ID from a Plex metadata item's Guid fields.
+            Returns int TMDb ID or None if not found.
+    """
+        guids = item.get("Guid", [])
+        for guid in guids:
+            guid_id = guid.get("id", "")
+            if guid_id.startswith("tmdb://"):
+                try:
+                    tmdb_id = int(guid_id.replace("tmdb://", ""))
+                    logger.debug(f"  Found TMDb ID in Plex: {tmdb_id}")
+                    return tmdb_id
+                except ValueError:
+                    logger.debug(f"  Failed to parse TMDb ID from: {guid_id}")
+                    continue
+        return None
+
+    async def get_tmdb_mapping(self) -> Dict[str, int]:
         """
-        # Calculate cutoff timestamp
-        cutoff_time = int(time.time()) - (days_back * 86400)
+        Scan Plex library sections and build mapping of ratingKey -> TMDb ID.
+        Returns dict: {rating_key: tmdb_id}
+        """
+        rating_to_tmdb = {}
     
-        # Fetch all play history
+        # Get all library sections
         try:
-            async with httpx.AsyncClient(timeout=60) as client:
-             response = await client.get(
-                    f"{self.url}/status/sessions/history/all?allUsers=1&X-Plex-Container-Start=0&X-Plex-Container-Size=1000",
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.get(
+                    f"{self.url}/library/sections",
                     headers=self.headers
                 )
                 response.raise_for_status()
                 data = response.json()
         except Exception as e:
-            logger.error(f"Failed to fetch Plex play history: {e}")
-            return []
+            logger.error(f"Failed to fetch Plex sections for TMDb mapping: {e}")
+            return rating_to_tmdb
     
-        metadata = data.get("MediaContainer", {}).get("Metadata", [])
-        logger.debug(f"Fetched {len(metadata)} total history entries")
+        sections = data.get("MediaContainer", {}).get("Directory", [])
+        movie_sections = [s for s in sections if s.get("type") == "movie"]
     
-        # Track play counts and last viewed per movie (by title + year)
+        logger.debug(f"Found {len(movie_sections)} movie sections to scan for TMDb IDs")
+    
+        for section in movie_sections:
+            section_id = section.get("key")
+            section_title = section.get("title", "Unknown")
+        
+            if not section_id:
+                continue
+        
+            logger.debug(f"Scanning section '{section_title}' (ID: {section_id}) for TMDb IDs...")
+        
+            try:
+                async with httpx.AsyncClient(timeout=120) as client:
+                    response = await client.get(
+                        f"{self.url}/library/sections/{section_id}/all",
+                        headers=self.headers
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+            except Exception as e:
+                logger.warning(f"Failed to fetch items from section {section_id}: {e}")
+                continue
+        
+            metadata = data.get("MediaContainer", {}).get("Metadata", [])
+            logger.debug(f"  Section has {len(metadata)} items")
+        
+            for item in metadata:
+                rating_key = str(item.get("ratingKey"))
+                if not rating_key:
+                    continue
+            
+                tmdb_id = self._extract_tmdb_from_item(item)
+            
+                if tmdb_id:
+                    rating_to_tmdb[rating_key] = tmdb_id
+                    logger.debug(f"  Mapped: {item.get('title')} ({rating_key}) -> TMDb: {tmdb_id}")
+    
+        logger.info(f"TMDb mapping complete: {len(rating_to_tmdb)} movies have TMDb IDs in Plex")
+        return rating_to_tmdb
+    
+    async def get_recently_played_movies(self, days_back: int, tmdb_mapping: Dict[str, int]) -> List[Dict]:
+        """
+        Get movies played in the last X days with pagination (no 1000 cap).
+        Returns list of dicts with title, year, tmdb_id (if available), play_count, last_viewed
+        """
+        cutoff_time = int(time.time()) - (days_back * 86400)
+    
+        all_history = []
+        start = 0
+        page_size = 1000
+    
+        logger.debug(f"Fetching play history with pagination (cutoff: {days_back} days ago)")
+    
+        while True:
+            try:
+                async with httpx.AsyncClient(timeout=60) as client:
+                    response = await client.get(
+                        f"{self.url}/status/sessions/history/all?allUsers=1&X-Plex-Container-Start={start}&X-Plex-Container-Size={page_size}",
+                        headers=self.headers
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+            except Exception as e:
+                logger.error(f"Failed to fetch Plex play history page (start={start}): {e}")
+                break
+        
+            metadata = data.get("MediaContainer", {}).get("Metadata", [])
+            if not metadata:
+                logger.debug(f"No metadata returned for page start={start}, stopping")
+                break
+        
+            all_history.extend(metadata)
+            page_num = (start // page_size) + 1
+            logger.debug(f"Fetched page {page_num}: {len(metadata)} entries (total so far: {len(all_history)})")
+        
+            # Check if we've fetched everything
+            total_size = data.get("MediaContainer", {}).get("totalSize", 0)
+            if total_size > 0 and len(all_history) >= total_size:
+                logger.debug(f"Reached totalSize={total_size}, stopping pagination")
+                break
+            if len(metadata) < page_size:
+                logger.debug(f"Last page had fewer than {page_size} entries, stopping pagination")
+                break
+        
+            start += len(metadata)
+    
+        logger.info(f"Fetched {len(all_history)} total history entries from Plex")
+    
+        # Process history entries
         play_stats: Dict[str, Dict] = {}
     
-        for item in metadata:
-            # Only process movies (type "movie")
+        for item in all_history:
+            # Only process movies
             if item.get("type") != "movie":
                 continue
         
@@ -215,19 +320,31 @@ class PlexClient:
             year = item.get("year", "")
         
             if not title:
+                logger.debug(f"Skipping item with no title: {item.get('ratingKey')}")
                 continue
         
-            # Create unique key from title + year
-            movie_key = f"{title}|{year}" if year else title
+            rating_key = str(item.get("ratingKey", ""))
             viewed_at = item.get("viewedAt", 0)
         
             if viewed_at < cutoff_time:
+                logger.debug(f"Skipping '{title} ({year})' - last viewed before cutoff")
                 continue
+        
+            # Try to get TMDb ID from mapping (if available)
+            tmdb_id = tmdb_mapping.get(rating_key)
+        
+            # Create unique key (use TMDb ID if available, otherwise title|year)
+            if tmdb_id:
+                movie_key = f"tmdb_{tmdb_id}"
+            else:
+                movie_key = f"{title}|{year}" if year else title
         
             if movie_key not in play_stats:
                 play_stats[movie_key] = {
                     "title": title,
                     "year": year,
+                    "tmdb_id": tmdb_id,
+                    "rating_key": rating_key,
                     "play_count": 0,
                     "last_viewed": 0
                 }
@@ -236,16 +353,25 @@ class PlexClient:
         
             if viewed_at > play_stats[movie_key]["last_viewed"]:
                 play_stats[movie_key]["last_viewed"] = viewed_at
+        
+            logger.debug(f"  Recorded play: '{title} ({year})' (TMDb: {tmdb_id}) - viewed at {viewed_at}")
     
         # Convert to list format
         result = list(play_stats.values())
     
+        # Count how many have TMDb IDs vs title/year only
+        with_tmdb = sum(1 for m in result if m.get("tmdb_id"))
+        without_tmdb = len(result) - with_tmdb
+    
         logger.info(f"Found {len(result)} movies played in the last {days_back} days")
+        logger.info(f"  - {with_tmdb} movies have TMDb IDs in Plex metadata")
+        logger.info(f"  - {without_tmdb} movies will use title/year matching")
     
         # Log first few for debugging
         for movie in result[:5]:
             last_viewed_date = datetime.fromtimestamp(movie["last_viewed"]).strftime("%Y-%m-%d")
-            logger.debug(f"  '{movie['title']} ({movie['year']})': {movie['play_count']} plays, last: {last_viewed_date}")
+            tmdb_info = f"TMDb:{movie['tmdb_id']}" if movie.get("tmdb_id") else "title/year only"
+            logger.debug(f"  '{movie['title']} ({movie['year']})' - {tmdb_info}, {movie['play_count']} plays, last: {last_viewed_date}")
     
         return result
 
@@ -267,6 +393,28 @@ class RadarrClient:
                 return True, "Connection successful"
         except Exception as e:
             return False, f"Connection failed: {str(e)}"
+    
+    async def get_movies_by_tmdb_id(self, tmdb_id: int) -> Optional[Dict]:
+        """Find a movie in Radarr by TMDb ID."""
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.get(
+                    f"{self.url}/api/v3/movie",
+                    headers=self.headers
+                )
+                response.raise_for_status()
+                movies = response.json()
+        except Exception as e:
+            logger.error(f"Failed to fetch movies from Radarr: {e}")
+            return None
+    
+        for movie in movies:
+            if movie.get("tmdbId") == tmdb_id:
+                logger.debug(f"Found movie in Radarr by TMDb ID: {movie.get('title')} (ID: {movie.get('id')})")
+                return movie
+    
+        logger.debug(f"No Radarr entry found for TMDb ID: {tmdb_id}")
+        return None
     
     async def get_movie_by_title_year(self, title: str, year: str) -> Optional[Dict]:
         """Find a movie in Radarr by title and year."""
@@ -463,9 +611,13 @@ async def main():
     state = load_last_run_state()
     processed_movies = state.get("processed_movies", {})
     
-    # Step 1: Get recently played movies from Plex (no mapping needed)
-    logger.info(f"Step 1: Fetching movies played in the last {config['recent_days']} days...")
-    recently_played = await plex.get_recently_played_movies(config["recent_days"])
+    # Step 1: Build TMDb mapping from Plex library (for accurate matching)
+    logger.info(f"Step 1: Building TMDb mapping from Plex library...")
+    tmdb_mapping = await plex.get_tmdb_mapping()
+
+    # Step 2: Get recently played movies with pagination
+    logger.info(f"Step 2: Fetching movies played in the last {config['recent_days']} days...")
+    recently_played = await plex.get_recently_played_movies(config["recent_days"], tmdb_mapping)
     
     if not recently_played:
         logger.info("No recently played movies found")
@@ -473,7 +625,7 @@ async def main():
         logger.info("replacarr Complete - Nothing to process")
         return
     
-    # Step 2: Check each movie in Radarr
+    # Step 3: Check each movie in Radarr
     logger.info("Step 3: Checking quality in Radarr...")
     
     movies_to_replace = []
@@ -481,8 +633,25 @@ async def main():
     
     for movie in recently_played:
         
-        # Find in Radarr by title/year
-        radarr_movie = await radarr.get_movie_by_title_year(movie["title"], movie["year"])
+        # Hybrid matching: try TMDb ID first, fall back to title/year
+        radarr_movie = None
+
+        # Strategy 1: Try TMDb ID (most accurate)
+        if movie.get("tmdb_id"):
+            logger.debug(f"Attempting TMDb lookup for '{movie['title']}': {movie['tmdb_id']}")
+            radarr_movie = await radarr.get_movies_by_tmdb_id(movie["tmdb_id"])
+            if radarr_movie:
+                logger.debug(f"  ✓ Found by TMDb ID: {movie['tmdb_id']}")
+
+        # Strategy 2: Fall back to title/year matching
+        if not radarr_movie:
+            logger.debug(f"Attempting title/year lookup for '{movie['title']} ({movie['year']})'")
+            radarr_movie = await radarr.get_movie_by_title_year(movie["title"], movie["year"])
+            if radarr_movie:
+                logger.debug(f"  ✓ Found by title/year")
+            else:
+                logger.debug(f"  ✗ Not found in Radarr")
+
         if not radarr_movie:
             logger.debug(f"Movie '{movie['title']} ({movie['year']})' not found in Radarr - skipping")
             continue
@@ -524,7 +693,7 @@ async def main():
         else:
             logger.debug(f"✗ '{movie_title} ({movie_year})' - {current_quality} → {reason}")
     
-    # Step 3: Apply replacements (up to max per run)
+    # Step 4: Apply replacements (up to max per run)
     logger.info(f"Step 4: Triggering replacements (max {config['max_replacements_per_run']} per run)...")
     
     replaced_count = 0
@@ -548,7 +717,7 @@ async def main():
         # Small delay between deletions
         await asyncio.sleep(1)
     
-    # Step 4: Save results
+    # Step 5: Save results
     logger.info("Step 5: Saving run results...")
     save_last_run_state(processed_movies)
     
