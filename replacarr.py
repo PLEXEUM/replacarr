@@ -526,6 +526,25 @@ class RadarrClient:
             logger.error(f"Failed to delete file: {e}")
             return False, str(e)
 
+    async def trigger_movie_search(self, movie_id: int) -> dict:
+        """Trigger an immediate search for a specific movie."""
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.post(
+                    f"{self.url}/api/v3/command",
+                    headers=self.headers,
+                    json={
+                        "name": "MoviesSearch",
+                        "movieIds": [movie_id]
+                    }
+                )
+                response.raise_for_status()
+                logger.debug(f"Triggered search for movie ID {movie_id}")
+                return response.json()
+        except Exception as e:
+            logger.error(f"Failed to trigger search for movie {movie_id}: {e}")
+            return {}
+
 # ============================================================================
 # State Management (Last Run Tracking)
 # ============================================================================
@@ -706,7 +725,9 @@ async def main():
         if success:
             replaced_count += 1
             logger.info(f"    ✓ {message}")
-            # Radarr will automatically search for replacement based on quality profile
+            # Trigger immediate search in Radarr
+            await radarr.trigger_movie_search(movie["movie_id"])
+            logger.info(f"    ✓ Triggered search for replacement")
         else:
             failed_count += 1
             logger.warning(f"    ✗ Failed: {message}")
